@@ -1,121 +1,74 @@
 #include <Servo.h>
 
-// -------------------- 핀/상수 --------------------
-static const uint8_t  PIN_IR    = A0;
-static const uint8_t  PIN_LED   = 9;
-static const uint8_t  PIN_SERVO = 10;
+#define PIN_IR    A0      
+#define PIN_LED   9
+#define PIN_SERVO 10
 
-static const uint32_t BAUD        = 1000000; // 플로터와 동일 설정
-static const uint32_t INTERVAL_MS = 35;      // 30~40ms 권장
+#define _DUTY_MIN 0     
+#define _DUTY_NEU 1480  
+#define _DUTY_MAX 2960  
 
-static const float DIST_MIN_MM = 100.0f; // 10 cm
-static const float DIST_MAX_MM = 250.0f; // 25 cm
+#define _DIST_MIN 100.0   
+#define _DIST_MAX 250.0   
 
-static const float ALPHA = 0.15f;        // 0.12~0.2 권장
-static const int   MAX_STEP_DEG = 3;     // 루프당 최대 변화(도)
+#define EMA_ALPHA 0.2     
 
-static const int SAFE_ANGLE = 90;
-static const unsigned long RETURN_DELAY_MS = 800;
+#define LOOP_INTERVAL 20  
 
-// -------------------- 상태 --------------------
-Servo myServo;
+Servo myservo;
+unsigned long last_loop_time;   
 
-float dist_raw_mm = NAN;
-float dist_ema_mm = NAN;
+float dist_ema = _DIST_MIN;  
 
-int last_servo_deg = SAFE_ANGLE;
-unsigned long last_update_ms = 0;
-unsigned long out_of_range_since = 0;
-
-// -------------------- 유틸 --------------------
-float clampf(float v, float lo, float hi) {
-  if (v < lo) return lo;
-  if (v > hi) return hi;
-  return v;
-}
-
-// 주어진 경험식: (6762/(a-9)-4)*10 - 60 [mm]
-float a0_to_dist_mm(int a) {
-  if (a <= 10) a = 10; // 분모 보호
-  return (6762.0f / (float(a) - 9.0f) - 4.0f) * 10.0f - 60.0f;
-}
-
-bool in_range_mm(float d) {
-  return (d >= DIST_MIN_MM && d <= DIST_MAX_MM);
-}
-
-// 100~250mm -> 0~180deg (map() 미사용)
-int dist_to_angle_deg(float d_mm) {
-  float d = clampf(d_mm, DIST_MIN_MM, DIST_MAX_MM);
-  float angle = (d - DIST_MIN_MM) * (180.0f / (DIST_MAX_MM - DIST_MIN_MM));
-  int ang = (int)(angle + 0.5f);
-  if (ang < 0)   ang = 0;
-  if (ang > 180) ang = 180;
-  return ang;
-}
-
-int step_limit(int target, int current, int max_step) {
-  int diff = target - current;
-  if (diff >  max_step) return current + max_step;
-  if (diff < -max_step) return current - max_step;
-  return target;
-}
-
-// -------------------- 설정 --------------------
-void setup() {
-  Serial.begin(BAUD);
+void setup()
+{
   pinMode(PIN_LED, OUTPUT);
-  myServo.attach(PIN_SERVO);
-  myServo.write(SAFE_ANGLE);
-  last_servo_deg = SAFE_ANGLE;
+  
+  myservo.attach(PIN_SERVO);  
+  myservo.writeMicroseconds(_DUTY_NEU); 
+  
+  Serial.begin(1000000);    
 }
 
-// -------------------- 루프 --------------------
-void loop() {
-  unsigned long now = millis();
-  if (now - last_update_ms < INTERVAL_MS) return;
-  last_update_ms = now;
+void loop()
+{
+  unsigned long time_curr = millis();
+  int duty;
+  float a_value, dist_raw;
 
-  // 1) 샘플링
-  int a = analogRead(PIN_IR);
+  if (time_curr < (last_loop_time + LOOP_INTERVAL))
+    return;
+  last_loop_time = time_curr; 
 
-  // 2) 거리 변환
-  dist_raw_mm = a0_to_dist_mm(a);
+  a_value = analogRead(PIN_IR);
+  
+  dist_raw = ((6762.0 / (a_value - 9.0)) - 4.0) * 10.0 - 60.0;
 
-  // 3) 범위 필터 + EMA
-  bool ok = in_range_mm(dist_raw_mm);
-
-  if (ok) {
-    // EMA 업데이트
-    if (isnan(dist_ema_mm)) dist_ema_mm = dist_raw_mm;
-    else dist_ema_mm = ALPHA * dist_raw_mm + (1.0f - ALPHA) * dist_ema_mm;
-
+  if (dist_raw >= _DIST_MIN && dist_raw <= _DIST_MAX) {
     digitalWrite(PIN_LED, HIGH);
-    out_of_range_since = 0;
-
-    // 목표각 산출(EMA 기준) + 각속도 제한
-    int target_deg = dist_to_angle_deg(dist_ema_mm);
-    int smooth_deg = step_limit(target_deg, last_servo_deg, MAX_STEP_DEG);
-    myServo.write(smooth_deg);
-    last_servo_deg = smooth_deg;
-
   } else {
-    // 범위 밖: LED OFF, 마지막 유효 각 유지
     digitalWrite(PIN_LED, LOW);
-
-    // 일정 시간 경과 후 안전각으로 서서히 복귀
-    if (out_of_range_since == 0) out_of_range_since = now;
-    int target_deg = (now - out_of_range_since > RETURN_DELAY_MS) ? SAFE_ANGLE : last_servo_deg;
-
-    int smooth_deg = step_limit(target_deg, last_servo_deg, MAX_STEP_DEG);
-    myServo.write(smooth_deg);
-    last_servo_deg = smooth_deg;
+    
+    if (dist_raw < _DIST_MIN) {
+      dist_raw = _DIST_MIN;
+    } else if (dist_raw > _DIST_MAX) {
+      dist_raw = _DIST_MAX;
+    }
   }
 
-  // 4) 시리얼 플로터용 출력(항상 한 줄)
-  // 포맷 예: IR:123,dist:180,dist_ema:175,servo:90
-  Serial.print("IR:");        Serial.print(a);
-  Serial.print(",dist:");     Serial.print((int)dist_raw_mm);
-  Serial.print(",dist_ema:"); Serial.print(isnan(dist_ema_mm) ? -1 : (int)dist_ema_mm);
-  Serial.print(",servo:");    Serial.println(last_servo_deg);
+  dist_ema = (EMA_ALPHA * dist_raw) + (1.0 - EMA_ALPHA) * dist_ema;
+      
+  duty = (int)( (dist_ema - _DIST_MIN) * (_DUTY_MAX - _DUTY_MIN) / (_DIST_MAX - _DIST_MIN) + _DUTY_MIN );
+  
+  myservo.writeMicroseconds(duty);
+
+  Serial.print("_DUTY_MIN:");  Serial.print(_DUTY_MIN);
+  Serial.print(",_DIST_MIN:"); Serial.print(_DIST_MIN);
+  Serial.print(",IR:");        Serial.print(a_value);
+  Serial.print(",dist_raw:");  Serial.print(dist_raw);
+  Serial.print(",ema:");       Serial.print(dist_ema);
+  Serial.print(",servo:");    Serial.print(duty);
+  Serial.print(",_DIST_MAX:"); Serial.print(_DIST_MAX);
+  Serial.print(",_DUTY_MAX:"); Serial.print(_DUTY_MAX);
+  Serial.println("");
 }
